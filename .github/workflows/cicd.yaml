@@ -1,103 +1,60 @@
-name: build-and-deploy
+deploy:
+  needs: build-and-push
+  runs-on: ubuntu-latest
+  env:
+    K8S_NAMESPACE: demo
+  steps:
+    - uses: actions/checkout@v4
 
-on:
-  push:
-    branches: [ main ]
+    - uses: azure/setup-kubectl@v4
 
-# Needed for pushing to GHCR with GITHUB_TOKEN
-permissions:
-  contents: read
-  packages: write
+    - name: Write kubeconfig
+      env:
+        KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+      run: |
+        mkdir -p $HOME/.kube
+        printf "%s" "$KUBE_CONFIG" > $HOME/.kube/config
+        chmod 600 $HOME/.kube/config
+        echo "KUBECONFIG=$HOME/.kube/config" >> $GITHUB_ENV
 
-env:
-  # CHANGE if you deploy to a different namespace
-  K8S_NAMESPACE: demo
-  # Set to "true" if your GHCR package is private AND your deployment uses imagePullSecrets: ghcr-pull
-  CREATE_PULL_SECRET: "false"
+    - name: Sanity check cluster access
+      run: |
+        kubectl config current-context
+        kubectl cluster-info
 
-jobs:
-  build-and-push:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    - name: Ensure namespace exists
+      run: |
+        kubectl get ns "${K8S_NAMESPACE}" >/dev/null 2>&1 || \
+        kubectl create ns "${K8S_NAMESPACE}"
 
-      - name: Compute lowercase owner/repo (GHCR requires lowercase)
-        id: names
-        run: |
-          OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
-          REPO_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
-          echo "OWNER_LC=$OWNER_LC" >> $GITHUB_ENV
-          echo "REPO_LC=$REPO_LC" >> $GITHUB_ENV
-          echo "IMAGE=ghcr.io/$OWNER_LC/$REPO_LC" >> $GITHUB_ENV
+    # (Optional) create GHCR pull secret if needed
+    - name: (Optional) Create GHCR imagePullSecret
+      if: env.CREATE_PULL_SECRET == 'true'
+      env:
+        GHCR_USERNAME: ${{ github.actor }}
+        GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        kubectl -n "${K8S_NAMESPACE}" get secret ghcr-pull >/dev/null 2>&1 || \
+        kubectl -n "${K8S_NAMESPACE}" create secret docker-registry ghcr-pull \
+          --docker-server=ghcr.io \
+          --docker-username="$GHCR_USERNAME" \
+          --docker-password="$GHCR_TOKEN"
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Apply manifests (root-level files)
+      run: |
+        kubectl -n "${K8S_NAMESPACE}" apply -f hello-deployment.yaml
+        kubectl -n "${K8S_NAMESPACE}" apply -f hello-service.yaml
+        kubectl -n "${K8S_NAMESPACE}" apply -f hello-ingress.yaml
 
-      - name: Build & Push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:latest
-          build-args: |
-            COMMIT_SHA=${{ github.sha }}
+    - name: Patch deployment to new image tag (commit SHA)
+      env:
+        IMAGE: ghcr.io/${{ github.repository_owner }}/ionos-k8s
+        SHA: ${{ github.sha }}
+      run: |
+        IMAGE=$(echo "$IMAGE" | tr '[:upper:]' '[:lower:]')
+        CONTAINER=$(kubectl -n "${K8S_NAMESPACE}" get deploy hello -o jsonpath='{.spec.template.spec.containers[0].name}')
+        kubectl -n "${K8S_NAMESPACE}" set image deployment/hello "$CONTAINER=${IMAGE}:${SHA}"
 
-  deploy:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout manifests
-        uses: actions/checkout@v4
-
-      - name: Install kubectl
-        uses: azure/setup-kubectl@v4
-
-      - name: Write kubeconfig from secret
-        run: |
-          mkdir -p $HOME/.kube
-          echo "${{ secrets.KUBE_CONFIG_B64 }}" | base64 -d > $HOME/.kube/config
-
-      - name: Ensure namespace exists
-        run: |
-          kubectl get ns "${{ env.K8S_NAMESPACE }}" >/dev/null 2>&1 || \
-          kubectl create ns "${{ env.K8S_NAMESPACE }}"
-
-      # Optional: create GHCR pull secret if your image is private AND your Deployment uses imagePullSecrets: ghcr-pull
-      - name: (Optional) Create GHCR imagePullSecret
-        if: env.CREATE_PULL_SECRET == 'true'
-        env:
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          kubectl -n "${{ env.K8S_NAMESPACE }}" get secret ghcr-pull >/dev/null 2>&1 || \
-          kubectl -n "${{ env.K8S_NAMESPACE }}" create secret docker-registry ghcr-pull \
-            --docker-server=ghcr.io \
-            --docker-username="$GHCR_USERNAME" \
-            --docker-password="$GHCR_TOKEN"
-
-      - name: Apply manifests (root-level files)
-        run: |
-          kubectl -n "${{ env.K8S_NAMESPACE }}" apply -f hello-deployment.yaml
-          kubectl -n "${{ env.K8S_NAMESPACE }}" apply -f hello-service.yaml
-          kubectl -n "${{ env.K8S_NAMESPACE }}" apply -f hello-ingress.yaml
-
-      - name: Patch deployment to new image tag (commit SHA)
-        env:
-          IMAGE: ghcr.io/${{ steps.names.outputs.OWNER_LC || env.OWNER_LC }}/${{ steps.names.outputs.REPO_LC || env.REPO_LC }}
-          SHA: ${{ github.sha }}
-        run: |
-          # detect the first container name in the deployment
-          CONTAINER=$(kubectl -n "${{ env.K8S_NAMESPACE }}" get deploy hello -o jsonpath='{.spec.template.spec.containers[0].name}')
-          kubectl -n "${{ env.K8S_NAMESPACE }}" set image deployment/hello "$CONTAINER=${IMAGE}:${SHA}"
-
-      - name: Wait for rollout
-        run: |
-          kubectl -n "${{ env.K8S_NAMESPACE }}" rollout status deployment/hello --timeout=120s
+    - name: Wait for rollout
+      run: kubectl -n "${K8S_NAMESPACE}" rollout status deployment/hello --timeout=120s
 
