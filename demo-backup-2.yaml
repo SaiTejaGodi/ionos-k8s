@@ -1,0 +1,8 @@
+apiVersion: velero.io/v1
+kind: Backup
+metadata:
+  name: demo-backup-2
+  namespace: velero
+spec:
+  includedNamespaces: ["demo"]
+  storageLocation: default

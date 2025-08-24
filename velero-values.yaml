@@ -1,0 +1,52 @@
+# ----- Velero config (this chart expects BSL/VSL here) -----
+configuration:
+  backupStorageLocation:
+    - name: default
+      provider: aws
+      bucket: cs-backup-saiteja
+      accessMode: ReadWrite
+      config:
+        region: eu-central-1
+        s3ForcePathStyle: "true"
+        s3Url: https://s3.eu-central-1.ionoscloud.com
+  volumeSnapshotLocation:
+    - name: default
+      provider: aws
+      config:
+        region: eu-central-1
+  defaultVolumesToFsBackup: true   # file-level PVC backups
+
+# no CSI snapshots
+snapshotsEnabled: false
+
+# restic/node-agent DaemonSet
+deployNodeAgent: true
+
+# AWS/S3 plugin
+plugins:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.8.2
+
+# credentials (use your rotated keys)
+credentials:
+  useSecret: true
+  secretContents:
+    cloud: |
+      [default]
+      aws_access_key_id=EAAAAAIY6OX5BEVHu6yTjRkeCbaekGOR0mWhWFeQyByB9G0tRgAAAAEB5scTAAAAAAHmxxM6X3qD2dfTi1DOAgotoOqt
+      aws_secret_access_key=G59qxvnNpkPVkojd5guwG+WVO7h78WGDT868wC59iniWqjRfm81fZ/F5ifL1s+eb
+
+# (Optional) small resources
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 512Mi
+initContainers:
+  - name: velero-plugin-for-aws
+    image: velero/velero-plugin-for-aws:v1.8.2
+    imagePullPolicy: IfNotPresent
+    volumeMounts:
+      - mountPath: /target
+        name: plugins
