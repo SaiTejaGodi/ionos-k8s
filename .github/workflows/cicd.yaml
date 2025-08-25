@@ -1,4 +1,5 @@
 name: build-and-deploy
+
 on:
   push:
     branches: [ main ]
@@ -7,9 +8,12 @@ permissions:
   contents: read
   packages: write
 
+# Simple constants only (no expressions here)
 env:
-  K8S_NAMESPACE: demo
-  CREATE_PULL_SECRET: "false"   # set "true" only if your Deployment uses imagePullSecrets: ghcr-pull
+  K8S_NAMESPACE: demo             # <-- change if needed
+  DEPLOYMENT_NAME: sample-nginx   # <-- change if your Deployment has a different name
+  CONTAINER_NAME: sample-nginx    # <-- change if your container has a different name
+  CREATE_PULL_SECRET: "false"     # set "true" only if your Deployment uses imagePullSecrets: ghcr-pull
 
 jobs:
   build-and-push:
@@ -21,8 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute lowercase owner/repo
+      - name: Compute lowercase owner/repo (GHCR requires lowercase)
         id: compute
+        shell: bash
         run: |
           OWNER_LC=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           REPO_LC=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
@@ -31,13 +36,16 @@ jobs:
           echo "image_sha=ghcr.io/$OWNER_LC/$REPO_LC:${{ github.sha }}" >> $GITHUB_OUTPUT
 
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/login-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - id: meta
+      - name: Docker metadata (tags + labels)
+        id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ steps.compute.outputs.owner_lc }}/${{ steps.compute.outputs.repo_lc }}
@@ -45,7 +53,8 @@ jobs:
             type=sha
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
-      - uses: docker/build-push-action@v6
+      - name: Build and push image
+        uses: docker/build-push-action@v6
         with:
           context: .
           push: true
@@ -57,36 +66,42 @@ jobs:
     needs: build-and-push
     env:
       K8S_NAMESPACE: demo
+      DEPLOYMENT_NAME: sample-nginx
+      CONTAINER_NAME: sample-nginx
       KUBECONFIG: $HOME/.kube/config
       IMAGE_SHA: ${{ needs.build-and-push.outputs.image_sha }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: azure/setup-kubectl@v4
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
         with:
           version: v1.29.6
 
-      - name: Write kubeconfig, set context, sanity check
+      - name: Write kubeconfig (RAW secret) + set context
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.kube"
-          echo "${{ secrets.KUBECONFIG_B64 }}" | base64 -d > "$HOME/.kube/config"
+          # Write kubeconfig exactly as stored in the secret (no base64 decoding)
+          printf "%s" "${{ secrets.KUBECONFIG_RAW }}" > "$HOME/.kube/config"
           chmod 600 "$HOME/.kube/config"
-          echo -n "Bytes in kubeconfig: "; wc -c < "$HOME/.kube/config"
 
-          # if current-context missing, pick one
-          if ! kubectl config current-context >/dev/null 2>&1; then
-            # Try the known IONOS context first, else fallback to first available
-            DEFAULT_CTX="cluster-admin@cs-k8s-cluster"
-            if kubectl config get-contexts "$DEFAULT_CTX" >/dev/null 2>&1; then
-              kubectl config use-context "$DEFAULT_CTX"
-            else
-              CTX=$(kubectl config get-contexts -o name | head -n 1)
-              [ -n "$CTX" ] || { echo "No contexts found in kubeconfig"; exit 1; }
-              kubectl config use-context "$CTX"
-            fi
+          echo "Sanity check (top of kubeconfig):"
+          head -n 15 "$HOME/.kube/config" || true
+
+          # Ensure kubeconfig has contexts and select one if none selected
+          if ! grep -qE '(^contexts:)' "$HOME/.kube/config"; then
+            echo "ERROR: kubeconfig has no 'contexts:' section. Check your KUBECONFIG_RAW secret."
+            exit 1
           fi
+
+          if ! kubectl config current-context >/dev/null 2>&1; then
+            CTX=$(kubectl config get-contexts -o name | head -n 1)
+            [ -n "$CTX" ] || { echo "ERROR: no contexts available in kubeconfig"; exit 1; }
+            kubectl config use-context "$CTX"
+          fi
+
           echo "Using context: $(kubectl config current-context)"
           kubectl cluster-info
 
@@ -103,22 +118,14 @@ jobs:
             --docker-username="${{ github.actor }}" \
             --docker-password="${{ secrets.GITHUB_TOKEN }}"
 
-      - name: Apply manifests
+      - name: Apply manifests (expects your YAML under k8s/)
         run: kubectl apply -n "$K8S_NAMESPACE" -f k8s/
 
-      - name: Patch deployment to new image (safe if missing)
+      - name: Patch deployment to new image
         run: |
-          if kubectl -n "$K8S_NAMESPACE" get deploy sample-nginx >/dev/null 2>&1; then
-            kubectl -n "$K8S_NAMESPACE" set image deploy/sample-nginx sample-nginx="$IMAGE_SHA"
-          else
-            echo "Deployment 'sample-nginx' not found; skipping image patch."
-          fi
+          kubectl -n "$K8S_NAMESPACE" set image deployment/"$DEPLOYMENT_NAME" "$CONTAINER_NAME"="$IMAGE_SHA"
 
-      - name: Wait for rollout (skip if missing)
+      - name: Wait for rollout
         run: |
-          if kubectl -n "$K8S_NAMESPACE" get deploy sample-nginx >/dev/null 2>&1; then
-            kubectl -n "$K8S_NAMESPACE" rollout status deploy/sample-nginx --timeout=5m
-          else
-            echo "No deployment to wait for."
-          fi
+          kubectl -n "$K8S_NAMESPACE" rollout status deployment/"$DEPLOYMENT_NAME" --timeout=5m
 
