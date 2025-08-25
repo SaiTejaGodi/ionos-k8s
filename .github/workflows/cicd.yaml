@@ -8,12 +8,12 @@ permissions:
   contents: read
   packages: write
 
-# Simple constants only (no expressions here)
 env:
-  K8S_NAMESPACE: demo             # <-- change if needed
-  DEPLOYMENT_NAME: sample-nginx   # <-- change if your Deployment has a different name
-  CONTAINER_NAME: sample-nginx    # <-- change if your container has a different name
-  CREATE_PULL_SECRET: "false"     # set "true" only if your Deployment uses imagePullSecrets: ghcr-pull
+  # <<< adjust these if needed >>>
+  K8S_NAMESPACE: demo
+  DEPLOYMENT_NAME: sample-nginx
+  CONTAINER_NAME: sample-nginx
+  CREATE_PULL_SECRET: "false"   # set "true" only if your Deployment uses imagePullSecrets: ghcr-pull
 
 jobs:
   build-and-push:
@@ -78,27 +78,49 @@ jobs:
         with:
           version: v1.29.6
 
-      - name: Write kubeconfig (RAW secret) + set context
+      - name: Write kubeconfig (raw OR base64), ensure context
         shell: bash
+        env:
+          KCFG_SECRET: ${{ secrets.KUBECONFIG_RAW }}
         run: |
           set -euo pipefail
           mkdir -p "$HOME/.kube"
-          # Write kubeconfig exactly as stored in the secret (no base64 decoding)
-          printf "%s" "${{ secrets.KUBECONFIG_RAW }}" > "$HOME/.kube/config"
-          chmod 600 "$HOME/.kube/config"
 
-          echo "Sanity check (top of kubeconfig):"
-          head -n 15 "$HOME/.kube/config" || true
+          # --- Write secret to temp, autodetect base64, normalize line-endings ---
+          TMP=$(mktemp)
+          printf "%s" "$KCFG_SECRET" > "$TMP"
 
-          # Ensure kubeconfig has contexts and select one if none selected
-          if ! grep -qE '(^contexts:)' "$HOME/.kube/config"; then
-            echo "ERROR: kubeconfig has no 'contexts:' section. Check your KUBECONFIG_RAW secret."
-            exit 1
+          if ! grep -q '^apiVersion:' "$TMP"; then
+            # try base64 decode
+            if base64 -d "$TMP" > "$TMP.dec" 2>/dev/null && grep -q '^apiVersion:' "$TMP.dec"; then
+              mv "$TMP.dec" "$TMP"
+            fi
           fi
 
+          tr -d '\r' < "$TMP" > "$HOME/.kube/config"
+          chmod 600 "$HOME/.kube/config"
+
+          echo "== kubeconfig header =="
+          head -n 12 "$HOME/.kube/config" || true
+          echo "======================="
+
+          # --- Validate presence of clusters & users ---
+          grep -q '^clusters:' "$HOME/.kube/config" || { echo "ERROR: kubeconfig missing 'clusters:'"; exit 1; }
+          grep -q '^users:'    "$HOME/.kube/config" || { echo "ERROR: kubeconfig missing 'users:'"; exit 1; }
+
+          # --- If no context, create one from first cluster+user ---
+          if ! kubectl config get-contexts -o name >/dev/null 2>&1 || [ -z "$(kubectl config get-contexts -o name || true)" ]; then
+            FIRST_CLUSTER=$(kubectl config view -o jsonpath='{.clusters[0].name}')
+            FIRST_USER=$(kubectl config view -o jsonpath='{.users[0].name}')
+            if [ -z "$FIRST_CLUSTER" ] || [ -z "$FIRST_USER" ]; then
+              echo "ERROR: cannot determine cluster/user to create a context"; exit 1;
+            fi
+            kubectl config set-context temp --cluster="$FIRST_CLUSTER" --user="$FIRST_USER" >/dev/null
+          fi
+
+          # --- Ensure a current-context is selected ---
           if ! kubectl config current-context >/dev/null 2>&1; then
-            CTX=$(kubectl config get-contexts -o name | head -n 1)
-            [ -n "$CTX" ] || { echo "ERROR: no contexts available in kubeconfig"; exit 1; }
+            CTX=$(kubectl config get-contexts -o name | head -n1)
             kubectl config use-context "$CTX"
           fi
 
@@ -118,7 +140,7 @@ jobs:
             --docker-username="${{ github.actor }}" \
             --docker-password="${{ secrets.GITHUB_TOKEN }}"
 
-      - name: Apply manifests (expects your YAML under k8s/)
+      - name: Apply manifests (expects YAML under k8s/)
         run: kubectl apply -n "$K8S_NAMESPACE" -f k8s/
 
       - name: Patch deployment to new image
