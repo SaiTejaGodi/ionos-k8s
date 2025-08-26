@@ -1,0 +1,8 @@
+k8s_namespace: demo
+deployment_name: sample-nginx
+container_name: sample-nginx
+image: "ghcr.io/saitejagodi/ionos-k8s:latest"
+replicas: 3
+min_replicas: 2
+max_replicas: 6
+cpu_target: 60
