@@ -1,0 +1,12 @@
+grafana:
+  # Load env vars GF_SMTP_USER / GF_SMTP_PASSWORD from the secret
+  envFromSecret: grafana-smtp
+
+  grafana.ini:
+    smtp:
+      enabled: true
+      host: smtp.gmail.com:587
+      skip_verify: true
+      from_address: yourgmail@gmail.com
+      from_name: Grafana Alerts
+

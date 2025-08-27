@@ -1,0 +1,19 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: hello-demo
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/SaiTejaGodi/ionos-k8s.git
+    path: k8s/demo              # folder above
+    targetRevision: HEAD
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: demo
+  syncPolicy:
+    automated:
+      prune: true               # delete drift
+      selfHeal: true            # auto-correct drift
+
