@@ -12,4 +12,10 @@ override.tf.json
 
 # OS/editor
 .DS_Store
-
+/k8s/demo/kubeconfig
+/k8s/demo/kubeconfig.yaml
+/k8s/demo/kubeconfig*.yaml
+/k8s/demo/*.kubeconfig
+kubeconfig
+kubeconfig.yaml
+kubeconfig*.yaml
